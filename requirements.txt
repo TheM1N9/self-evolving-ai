@@ -1,0 +1,8 @@
+google-generativeai
+opencv-python
+numpy
+mss
+python-dotenv 
+pillow
+pyautogui
+pytesseract
