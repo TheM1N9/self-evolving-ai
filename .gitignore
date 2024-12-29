@@ -5,6 +5,7 @@ s-venv
 agent_history
 agent_output
 logs
+ui_templates
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
