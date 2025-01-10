@@ -1,4 +1,4 @@
-from agent import ScreenAgent, VerifierAgent
+from agent import ScreenAgent, VerifierAgent, GoalSimplifierAgent, LearningAgent
 import asyncio
 import google.generativeai as genai
 import time
@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import os
 from datetime import datetime
+import re
 
 
 class AgentOrchestrator:
@@ -25,6 +26,12 @@ class AgentOrchestrator:
         self.chat_history_file = "agent_history/chat_history.json"
         os.makedirs("agent_history", exist_ok=True)
         self.load_chat_history()
+
+        # Create goal simplifier agent
+        self.create_agent("goal_simplifier", agent_type="simplifier", is_async=False)
+
+        # Create learning agent
+        self.create_agent("learner", agent_type="learner", is_async=False)
 
     def load_chat_history(self):
         """Load chat history from file at startup"""
@@ -47,13 +54,48 @@ class AgentOrchestrator:
             print(f"Failed to save chat history: {e}")
 
     def append_chat_history(self, entry):
-        """Add new entry to chat history and save"""
-        entry["timestamp"] = datetime.now().isoformat()
-        self.chat_history.append(entry)
-        self.save_chat_history()
-        # Update chat history for all agents
-        for agent in self.agents.values():
-            agent.chat_history = self.chat_history
+        """Append entry to chat history with error recovery"""
+        try:
+            # Load existing history with recovery
+            history = []
+            if os.path.exists("agent_history/chat_history.json"):
+                try:
+                    with open("agent_history/chat_history.json", "r") as f:
+                        history = json.load(f)
+                except json.JSONDecodeError:
+                    # Backup corrupted file
+                    backup_path = (
+                        f"agent_history/chat_history_backup_{int(time.time())}.json"
+                    )
+                    os.rename("agent_history/chat_history.json", backup_path)
+                    print(f"Corrupted history backed up to: {backup_path}")
+                    history = []  # Start fresh
+
+            # Sanitize the entry
+            sanitized_entry = {}
+            for key, value in entry.items():
+                if isinstance(value, (str, int, bool, list, dict)):
+                    sanitized_entry[key] = value
+                else:
+                    # Convert non-standard types to string representation
+                    sanitized_entry[key] = str(value)
+
+            # Add timestamp
+            sanitized_entry["timestamp"] = datetime.now().isoformat()
+
+            # Append new entry
+            history.append(sanitized_entry)
+
+            # Save with pretty printing
+            with open("agent_history/chat_history.json", "w") as f:
+                json.dump(history, f, indent=4, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"Failed to save chat history: {str(e)}")
+            # Create new history file if needed
+            if not os.path.exists("agent_history/chat_history.json"):
+                with open("agent_history/chat_history.json", "w") as f:
+                    json.dump([], f)
 
     def create_agent(self, agent_id, agent_type="screen", is_async=False):
         """Create a new agent with specific role and shared chat history"""
@@ -63,6 +105,14 @@ class AgentOrchestrator:
             )
         elif agent_type == "verifier":
             self.agents[agent_id] = VerifierAgent(
+                self.api_key, is_async=is_async, role=agent_id
+            )
+        elif agent_type == "simplifier":
+            self.agents[agent_id] = GoalSimplifierAgent(
+                self.api_key, is_async=is_async, role=agent_id
+            )
+        elif agent_type == "learner":
+            self.agents[agent_id] = LearningAgent(
                 self.api_key, is_async=is_async, role=agent_id
             )
 
@@ -90,21 +140,17 @@ class AgentOrchestrator:
     async def run_agent_loop(self):
         """Coordinate agents in a loop with improved error handling and cleanup"""
         self.running = True
-        max_verification_attempts = 3  # Maximum number of verification attempts
-        max_retries = 10  # Maximum retries for file activation
+        max_verification_attempts = 3
+        max_retries = 10
+        self.continuous_video_history = []  # For goal generator's context
 
         while self.running:
             try:
-                # Record initial state
-                video_path = self.agents["goal_generator"].record_screen()
-                print(f"Video recorded: {video_path}")
-                execution_video_path = None  # Initialize to None
+                # Start continuous recording for goal generator
+                continuous_video_path = self.agents["goal_generator"].start_recording()
+                print(f"Started continuous recording for goal generator")
 
                 try:
-                    with open(video_path, "rb") as f:
-                        video_file = genai.upload_file(f, mime_type="video/avi")
-                        print(f"Video file uploaded: {video_file.name}")
-
                     # Get current screen snapshot
                     screen = self.agents["goal_generator"].screen_capture.grab(
                         self.agents["goal_generator"].screen_capture.monitors[1]
@@ -115,160 +161,249 @@ class AgentOrchestrator:
                         mime_type="image/png",
                     )
 
-                    # Wait for file to become ACTIVE
-                    retry_count = 0
-                    while (
-                        video_file.state.name == "PROCESSING"
-                        and retry_count < max_retries
-                    ):
-                        time.sleep(1)
-                        retry_count += 1
-                        video_file = genai.get_file(video_file.name)
+                    # Get last three continuous videos for context
+                    recent_videos = (
+                        self.continuous_video_history[-3:]
+                        if len(self.continuous_video_history) >= 3
+                        else self.continuous_video_history
+                    )
+                    latest_video = (
+                        self.continuous_video_history[-1]
+                        if self.continuous_video_history
+                        else None
+                    )
 
-                    if video_file.state.name != "ACTIVE":
-                        raise Exception(
-                            f"File failed to become active. State: {video_file.state.name}"
+                    # Process experiences before goal generation
+                    learning_result = await self.agents["learner"].process_experience(
+                        video_history=self.continuous_video_history,
+                        current_screen=screen_image,
+                        chat_history=self.chat_history,
+                    )
+
+                    if learning_result["success"]:
+                        self.append_chat_history(
+                            {
+                                "type": "learning_update",
+                                "updates": learning_result["updates"],
+                                "agent": "learner",
+                            }
                         )
 
-                    # First clean up old videos
-                    await self.cleanup_old_videos()
-                    # Then add new video to history
-                    self.video_history.append(video_file)
-
-                    # Generate goal with shared chat history
+                    # Generate main goal
                     goal = await self.agents["goal_generator"].generate_goal(
-                        video_file=video_file,
-                        video_history=self.video_history,
+                        video_file=latest_video,
+                        video_history=recent_videos,
                         current_screen=screen_image,
                     )
 
                     if goal:
-                        # Add goal generation to chat history
-                        self.append_chat_history(
-                            {
-                                "type": "goal_generation",
-                                "goal": goal,
-                                "agent": "goal_generator",
-                            }
-                        )
+                        # Initialize sub-goals tracking
+                        previous_sub_goals = []
+                        main_goal_completed = False
 
-                        commands = self.agents["goal_executor"].goal_parser(goal)
-                        verification_attempts = 0
-                        execution_success = False
+                        while not main_goal_completed:
+                            # Get current screen elements for context
+                            current_elements = self.agents[
+                                "goal_executor"
+                            ].get_clickable_elements()
 
-                        while (
-                            not execution_success
-                            and verification_attempts < max_verification_attempts
-                        ):
-                            verification_attempts += 1
-                            print(
-                                f"Execution attempt {verification_attempts}/{max_verification_attempts}"
+                            # Get current screen snapshot
+                            screen = self.agents["goal_simplifier"].screen_capture.grab(
+                                self.agents["goal_simplifier"].screen_capture.monitors[
+                                    1
+                                ]
+                            )
+                            screen_array = np.array(screen)
+                            screen_image = genai.upload_file(
+                                BytesIO(cv2.imencode(".png", screen_array)[1]),
+                                mime_type="image/png",
                             )
 
-                            # Start recording before execution
-                            execution_video_path = self.agents[
-                                "goal_generator"
-                            ].start_recording()
+                            # Get next batch of sub-goals
+                            simplified_goal_data = await self.agents[
+                                "goal_simplifier"
+                            ].simplify_goal(
+                                goal["goal"],
+                                current_screen=screen_image,
+                                available_elements=current_elements,
+                                previous_goals=previous_sub_goals,
+                            )
 
-                            # Execute commands
-                            execution_result = await self.agents[
-                                "goal_executor"
-                            ].execute_goal(goal, commands)
-                            await self.agents["goal_executor"].wait_for_completion()
+                            if not simplified_goal_data:
+                                break
 
-                            # Stop recording after execution
-                            self.agents["goal_generator"].stop_recording()
+                            # Check if main goal is completed
+                            main_goal_completed = simplified_goal_data.get(
+                                "main_goal_completed", False
+                            )
+                            if main_goal_completed:
+                                break
 
-                            if execution_result.get("success"):
-                                # Upload the execution video
-                                with open(execution_video_path, "rb") as f:
-                                    execution_video = genai.upload_file(
-                                        f, mime_type="video/avi"
+                            # Execute each sub-goal with dependency handling
+                            for sub_goal in simplified_goal_data["sub_goals"]:
+                                # Check prerequisites
+                                prerequisites_met = True
+                                for prereq in sub_goal.get("prerequisites", []):
+                                    if prereq not in [
+                                        g["goal"]
+                                        for g in previous_sub_goals
+                                        if g["status"] == "completed"
+                                    ]:
+                                        prerequisites_met = False
+                                        break
+
+                                if not prerequisites_met:
+                                    print(
+                                        f"Prerequisites not met for sub-goal: {sub_goal['goal']}"
                                     )
+                                    continue
 
-                                # Wait for execution video to become ACTIVE
-                                retry_count = 0
-                                while (
-                                    execution_video.state.name == "PROCESSING"
-                                    and retry_count < max_retries
-                                ):
-                                    time.sleep(1)
-                                    retry_count += 1
-                                    execution_video = genai.get_file(
-                                        execution_video.name
+                                # Check dependencies
+                                dependencies_met = True
+                                for dep_id in sub_goal.get("depends_on", []):
+                                    if dep_id not in [
+                                        g.get("id")
+                                        for g in previous_sub_goals
+                                        if g["status"] == "completed"
+                                    ]:
+                                        dependencies_met = False
+                                        break
+
+                                if not dependencies_met:
+                                    print(
+                                        f"Dependencies not met for sub-goal: {sub_goal['goal']}"
                                     )
+                                    continue
 
-                                # Get current screen elements
-                                current_elements = self.agents[
+                                execution_video_path = self.agents[
                                     "goal_executor"
-                                ].get_clickable_elements()
+                                ].start_recording()
 
-                                # Verify execution with video and elements
-                                verification = await self.agents[
-                                    "verifier"
-                                ].verify_execution(
-                                    goal=goal,
-                                    original_commands=commands,
-                                    execution_video=execution_video,
-                                    execution_logs=execution_result.get("logs", []),
-                                    available_elements=current_elements,
+                                try:
+                                    # Try primary commands first
+                                    execution_result = await self.agents[
+                                        "goal_executor"
+                                    ].execute_goal({"goal": sub_goal["goal"]})
+
+                                    # If primary commands fail, try fallback commands
+                                    if not execution_result.get(
+                                        "success"
+                                    ) and sub_goal.get("fallback_commands"):
+                                        print(
+                                            f"Primary commands failed, trying fallback for: {sub_goal['goal']}"
+                                        )
+                                        execution_result = await self.agents[
+                                            "goal_executor"
+                                        ].execute_goal(
+                                            {"goal": sub_goal["goal"]},
+                                            sub_goal["fallback_commands"],
+                                        )
+
+                                    # Record the result
+                                    sub_goal["status"] = (
+                                        "completed"
+                                        if execution_result.get("success")
+                                        else "failed"
+                                    )
+                                    sub_goal["execution_result"] = execution_result
+                                    previous_sub_goals.append(sub_goal)
+
+                                    # Log sub-goal execution
+                                    self.append_chat_history(
+                                        {
+                                            "type": "sub_goal_execution",
+                                            "sub_goal": sub_goal,
+                                            "result": execution_result,
+                                            "progress_percentage": simplified_goal_data.get(
+                                                "progress_percentage", 0
+                                            ),
+                                            "agent": "goal_executor",
+                                        }
+                                    )
+
+                                    # If execution failed, get new sub-goals immediately
+                                    if not execution_result.get("success"):
+                                        print(
+                                            f"Sub-goal failed: {sub_goal['goal']}, updating plan..."
+                                        )
+                                        break
+
+                                finally:
+                                    self.agents["goal_executor"].stop_recording()
+                                    if execution_video_path:
+                                        self.agents["goal_executor"].cleanup_video(
+                                            execution_video_path
+                                        )
+
+                                await asyncio.sleep(1)  # Small delay between sub-goals
+
+                            # If main goal is completed, process the learning
+                            if main_goal_completed:
+                                learning_result = await self.agents[
+                                    "learner"
+                                ].process_experience(
+                                    video_history=self.continuous_video_history,
+                                    current_screen=screen_image,
+                                    chat_history=self.chat_history,
                                 )
 
-                                if verification.get("execution") == "success":
-                                    print("Goal executed successfully!")
-                                    execution_success = True
-
-                                    # Add verification to chat history
-                                    self.append_chat_history(
-                                        {
-                                            "type": "verification",
-                                            "goal": goal,
-                                            "success": True,
-                                            "agent": "verifier",
-                                        }
-                                    )
-                                else:
-                                    print(
-                                        f"Execution attempt {verification_attempts} failed, trying new commands..."
-                                    )
-                                    commands = verification.get("commands")
-
-                                    # Add failed verification to chat history
-                                    self.append_chat_history(
-                                        {
-                                            "type": "verification",
-                                            "goal": goal,
-                                            "success": False,
-                                            "reason": verification.get("reason"),
-                                            "new_commands": commands,
-                                            "agent": "verifier",
-                                        }
-                                    )
-                            else:
-                                # Add failed execution to chat history
                                 self.append_chat_history(
                                     {
-                                        "type": "execution",
+                                        "type": "final_learning",
                                         "goal": goal,
-                                        "commands": commands,
-                                        "success": False,
-                                        "error": execution_result.get("error"),
-                                        "agent": "goal_executor",
+                                        "sub_goals": previous_sub_goals,
+                                        "learning": learning_result,
+                                        "agent": "learner",
                                     }
                                 )
 
-                        if not execution_success:
-                            print(
-                                f"Failed to execute goal after {max_verification_attempts} attempts"
+                    # Stop and process continuous recording
+                    self.agents["goal_generator"].stop_recording()
+                    try:
+                        with open(continuous_video_path, "rb") as f:
+                            continuous_video = genai.upload_file(
+                                f, mime_type="video/avi"
                             )
 
+                        # Wait for continuous video to become ACTIVE
+                        retry_count = 0
+                        while (
+                            continuous_video.state.name == "PROCESSING"
+                            and retry_count < max_retries
+                        ):
+                            time.sleep(1)
+                            retry_count += 1
+                            continuous_video = genai.get_file(continuous_video.name)
+
+                        # Update continuous video history
+                        self.continuous_video_history.append(continuous_video)
+                        while len(self.continuous_video_history) > self.max_history:
+                            old_video = self.continuous_video_history.pop(0)
+                            try:
+                                genai.delete_file(old_video.name)
+                            except Exception as e:
+                                print(f"Failed to delete old video: {e}")
+
+                    except Exception as e:
+                        print(f"Failed to process continuous recording: {e}")
+
                 finally:
-                    # Clean up local video files
-                    self.agents["goal_generator"].cleanup_video(video_path)
-                    if execution_video_path:  # Only cleanup if path exists
-                        self.agents["goal_generator"].cleanup_video(
-                            execution_video_path
-                        )
+                    # Cleanup continuous recording with error handling
+                    if continuous_video_path:
+                        try:
+                            self.agents["goal_generator"].cleanup_video(
+                                continuous_video_path
+                            )
+                        except Exception as e:
+                            print(f"Failed to cleanup continuous recording: {e}")
+                            # Add delay to allow file to be released
+                            await asyncio.sleep(1)
+                            try:
+                                self.agents["goal_generator"].cleanup_video(
+                                    continuous_video_path
+                                )
+                            except Exception as e:
+                                print(f"Second cleanup attempt failed: {e}")
 
                 await asyncio.sleep(self.recording_interval)
 
